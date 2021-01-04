@@ -124,6 +124,14 @@ func pkcs7Unpad(b []byte, blocksize int) []byte {
 	return b[:len(b)-n]
 }
 
+func (c *Crypto) EncryptAttributes(at []byte, iv []byte) ([]byte, error) {
+	ct := pkcs7Pad(at, blowfish.BlockSize)
+	if err := cryptBlowfish(true, ct, c.keyAttributes, iv); err != nil {
+		return nil, err
+	}
+	return append(iv, ct...), nil
+}
+
 func (c *Crypto) DecryptAttributes(at []byte) ([]byte, error) {
 	iv := at[:blowfish.BlockSize]
 	ct := at[blowfish.BlockSize:]
@@ -143,6 +151,10 @@ func (c *Crypto) DecryptFilename(fn []byte) ([]byte, error) {
 func (c *Crypto) EncryptFilename(fn []byte) ([]byte, error) {
 	p := pkcs7Pad(fn, blowfish.BlockSize)
 	return p, cryptBlowfish(true, p, c.keyFilename, c.keyFilenameIV)
+}
+
+func (c *Crypto) EncryptBlockIndexEntry(be []byte, iv []byte) error {
+	return cryptBlowfish(true, be, c.keyBlockIndex, iv)
 }
 
 func (c *Crypto) DecryptBlockIndexEntry(be []byte, iv []byte) error {
@@ -167,13 +179,24 @@ func cryptBlowfish(enc bool, ct, key, iv []byte) error {
 	return nil
 }
 
+func (c *Crypto) EncryptFileData(fd, iv []byte) ([]byte, error) {
+	ct := pkcs7Pad(fd, aes.BlockSize)
+	if _, err := cryptAES(true, ct, c.keyFileDataAES, iv); err != nil {
+		return nil, err
+	}
+	return append(iv, ct...), nil
+}
+
 func (c *Crypto) DecryptFileData(fd []byte) ([]byte, error) {
 	iv := fd[:aes.BlockSize]
 	ct := fd[aes.BlockSize:]
-	return decryptAES(ct, c.keyFileDataAES, iv)
+	if _, err := cryptAES(false, ct, c.keyFileDataAES, iv); err != nil {
+		return nil, err
+	}
+	return pkcs7Unpad(ct, aes.BlockSize), nil
 }
 
-func decryptAES(ct, key, iv []byte) ([]byte, error) {
+func cryptAES(enc bool, ct, key, iv []byte) ([]byte, error) {
 	ci, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -181,9 +204,14 @@ func decryptAES(ct, key, iv []byte) ([]byte, error) {
 	if len(ct)%aes.BlockSize != 0 {
 		return nil, fmt.Errorf("AES text is not a multiple of %v", aes.BlockSize)
 	}
-	dec := cipher.NewCBCDecrypter(ci, iv)
-	dec.CryptBlocks(ct, ct)
-	return pkcs7Unpad(ct, aes.BlockSize), nil
+	var cbc cipher.BlockMode
+	if enc {
+		cbc = cipher.NewCBCEncrypter(ci, iv)
+	} else {
+		cbc = cipher.NewCBCDecrypter(ci, iv)
+	}
+	cbc.CryptBlocks(ct, ct)
+	return ct, nil
 }
 
 func (c *Crypto) Decompress(in, out []byte) error {

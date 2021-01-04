@@ -3,6 +3,8 @@ package client
 import (
 	"bbq/client/proto"
 	"bytes"
+	"crypto/md5"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 
@@ -192,7 +194,6 @@ func (b *BoxBackup) DeleteFile(d int64, fn string) error {
 }
 
 func (b *BoxBackup) StoreFile(d, m, a int64, fn string, fc []byte) error {
-
 	// First prepare the file stream
 	buf := bytes.NewBuffer([]byte{})
 
@@ -210,46 +211,51 @@ func (b *BoxBackup) StoreFile(d, m, a int64, fn string, fc []byte) error {
 	ef, _ := b.writeFilename(fn)
 	buf.Write(ef)
 
-	// Attributes
-	var as int32
-	var ab uint8 = 2
-	var at proto.AttributeStream
-
-	as = int32(binary.Size(ab) + binary.Size(at))
-	binary.Write(buf, binary.BigEndian, &as)
-	binary.Write(buf, binary.BigEndian, &ab)
-	binary.Write(buf, binary.BigEndian, &at)
+	// Attribute block
+	if err := b.writeAttributes(buf, &RemoteFile{}); err != nil {
+		return err
+	}
 
 	// Send the file data right away, as in Storage format.
 	// Block index will come trailing
-	var fb uint8
-	//fb = 2 << 1
-	fb = 0 << 1
-	binary.Write(buf, binary.BigEndian, &fb)
-	buf.Write(fc)
+	var bh uint8 = 0b10
+	binary.Write(buf, binary.BigEndian, &bh)
+
+	iv := make([]byte, 16)
+	rand.Read(iv)
+	ct, err := b.crypt.EncryptFileData(fc, iv)
+	if err != nil {
+		return err
+	}
+	buf.Write(ct)
+	// Length of this fileblock including the byte header
+	var bies int64 = int64(len(ct) + 1)
 
 	// Block Index
 	bih := proto.FileBlockIndex{
 		MagicValue:  0x62696478,
 		OtherFileID: 0,
-		EntryIVBase: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
 		NumBlocks:   1,
 	}
+	rand.Read(bih.EntryIVBase[:])
 
-	// Length of the fileblock including the byte header
-	var bies int64 = int64(len(fc) + 1)
 	bie := proto.FileBlockIndexEntry{
-		Size:           int32(len(fc) + 1), // decrypted size
+		Size:           int32(len(fc)), // decrypted size
 		WeakChecksum:   1,
-		StrongChecksum: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8},
+		StrongChecksum: md5.Sum(fc),
 	}
+	bi := bytes.NewBuffer([]byte{})
+	binary.Write(bi, binary.BigEndian, &bie)
+	ei := bi.Next(binary.Size(bie))
+	b.crypt.EncryptBlockIndexEntry(ei, bih.EntryIVBase[:])
+
 	binary.Write(buf, binary.BigEndian, &bih)
 	binary.Write(buf, binary.BigEndian, &bies)
-	binary.Write(buf, binary.BigEndian, &bie)
+	binary.Write(buf, binary.BigEndian, &ei)
 
 	glg.Logf("buf: % X", buf)
 
-	_, err := b.Execute(&Operation{
+	_, err = b.Execute(&Operation{
 		Op: proto.StoreFile{
 			DirectoryObjectID: d,
 			ModificationTime:  m,

@@ -4,6 +4,7 @@ import (
 	"bbq/client/proto"
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -37,6 +38,21 @@ type blockIndex struct {
 	Index  proto.FileBlockIndex
 	Sizes  []int64
 	Blocks []proto.FileBlockIndexEntry
+}
+
+func (b *BoxBackup) writeBlockIndex(buf *bytes.Buffer, bix *blockIndex) error {
+	binary.Write(buf, binary.BigEndian, &bix.Index)
+	for i, s := range bix.Sizes {
+		binary.Write(buf, binary.BigEndian, &s)
+
+		// Encrypt the actual block
+		bi := bytes.NewBuffer([]byte{})
+		binary.Write(bi, binary.BigEndian, bix.Blocks[i])
+		ei := bi.Next(binary.Size(bix.Blocks[i]))
+		b.crypt.EncryptBlockIndexEntry(ei, bix.Index.EntryIVBase[:])
+		binary.Write(buf, binary.BigEndian, ei)
+	}
+	return nil
 }
 
 func (b *BoxBackup) readBlockIndex(rd *Stream) *blockIndex {
@@ -103,8 +119,39 @@ func (b *BoxBackup) writeFilename(fn string) ([]byte, error) {
 	return buf, nil
 }
 
-func (b *BoxBackup) readAttributes(rd *Stream, rf *RemoteFile) error {
+func (b *BoxBackup) writeAttributes(buf *bytes.Buffer, rf *RemoteFile) error {
+	at := proto.AttributeStream{
+		AttributeType:    1, // ATTRIBUTETYPE_GENERIC_UNIX
+		UID:              rf.UID,
+		GID:              rf.GID,
+		ModificationTime: uint64(rf.ModificationTime.Unix() * 1e6),
+		// TODO: fill out the missing members
+		// AttrModificationTime uint64
+		// UserDefinedFlags     uint32
+		// FileGenerationNumber uint32
+		Mode: rf.mode,
+	}
+	eab := bytes.NewBuffer([]byte{})
+	binary.Write(eab, binary.BigEndian, &at)
+	ea := eab.Next(binary.Size(at))
 
+	iv := make([]byte, 8)
+	rand.Read(iv)
+	eat, err := b.crypt.EncryptAttributes(ea, iv)
+	if err != nil {
+		return err
+	}
+
+	var ae uint8 = 2 // Attribute encoding (Blowfish)
+	var s int32 = int32(binary.Size(ae) + len(eat))
+	binary.Write(buf, binary.BigEndian, &s)
+	binary.Write(buf, binary.BigEndian, &ae)
+	binary.Write(buf, binary.BigEndian, eat)
+
+	return nil
+}
+
+func (b *BoxBackup) readAttributes(rd *Stream, rf *RemoteFile) error {
 	var skip []byte
 	for {
 		p, err := rd.reader.Peek(4)
@@ -137,7 +184,6 @@ func (b *BoxBackup) readAttributes(rd *Stream, rf *RemoteFile) error {
 
 		a := make([]byte, s-1)
 		io.ReadFull(rd, a)
-		//glg.Logf("attributes: % X", a)
 		ab, err := b.crypt.DecryptAttributes(a)
 		if err != nil {
 			return fmt.Errorf("decrypting attributes: %v", err)
@@ -148,7 +194,7 @@ func (b *BoxBackup) readAttributes(rd *Stream, rf *RemoteFile) error {
 		binary.Read(ar, binary.BigEndian, &at)
 		glg.Debugf("decoded attributes: %+v, mode: %o", at, at.Mode)
 		if at.AttributeType != 1 { // ATTRIBUTETYPE_GENERIC_UNIX
-			return fmt.Errorf("unknown attribute encoding method: %v", at.AttributeType)
+			return fmt.Errorf("unknown attribute type: %v", at.AttributeType)
 		}
 		if ar.Len() > 0 {
 			glg.Warnf("leftover attributes: %v [% X]", ar.Len(), ab[len(ab)-ar.Len():])
@@ -161,8 +207,6 @@ func (b *BoxBackup) readAttributes(rd *Stream, rf *RemoteFile) error {
 		rf.AttributesModTime = time.Unix(int64(at.AttrModificationTime/1e6), 0)
 		rf.FileGenerationNumber = at.FileGenerationNumber
 		rf.mode = at.Mode
-
-		return nil
 	}
 	return nil
 }
@@ -233,7 +277,10 @@ func (b *BoxBackup) readFileStream(rd *Stream, idx *blockIndex) {
 	if fn, err := b.readFilenameStream(rd); err != nil {
 		f.name = fn
 	}
-	b.readAttributes(rd, f)
+	if err := b.readAttributes(rd, f); err != nil {
+		glg.Error("readFileStream:", err)
+		return
+	}
 
 	var preread []byte
 	prep := int64(0)
@@ -291,7 +338,7 @@ func (b *BoxBackup) readFileStream(rd *Stream, idx *blockIndex) {
 			// TODO: verify checksum
 
 		} else {
-			glg.Infof("Decoded: %s", ct)
+			glg.Infof("Decoded: %s [% X]", ct, ct)
 		}
 	}
 }
