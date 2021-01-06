@@ -195,7 +195,7 @@ func (b *BoxBackup) DeleteFile(d int64, fn string) error {
 
 func (b *BoxBackup) StoreFile(d, m, a int64, fn string, fc []byte) error {
 	// First prepare the file stream
-	buf := bytes.NewBuffer([]byte{})
+	buf := new(bytes.Buffer)
 
 	fs := proto.FileStreamFormat{
 		MagicValue:        0x66696C65,
@@ -228,32 +228,25 @@ func (b *BoxBackup) StoreFile(d, m, a int64, fn string, fc []byte) error {
 		return err
 	}
 	buf.Write(ct)
-	// Length of this fileblock including the byte header
-	var bies int64 = int64(len(ct) + 1)
 
 	// Block Index
-	bih := proto.FileBlockIndex{
-		MagicValue:  0x62696478,
-		OtherFileID: 0,
-		NumBlocks:   1,
+	bi := blockIndex{
+		Index: proto.FileBlockIndex{
+			MagicValue:  0x62696478,
+			OtherFileID: 0,
+			NumBlocks:   1,
+		},
 	}
-	rand.Read(bih.EntryIVBase[:])
+	rand.Read(bi.Index.EntryIVBase[:])
 
-	bie := proto.FileBlockIndexEntry{
+	// Length of this fileblock including the byte header
+	bi.Sizes = append(bi.Sizes, int64(len(ct)+1))
+	bi.Blocks = append(bi.Blocks, proto.FileBlockIndexEntry{
 		Size:           int32(len(fc)), // decrypted size
-		WeakChecksum:   1,
+		WeakChecksum:   calcRollingChecksum(fc),
 		StrongChecksum: md5.Sum(fc),
-	}
-	bi := bytes.NewBuffer([]byte{})
-	binary.Write(bi, binary.BigEndian, &bie)
-	ei := bi.Next(binary.Size(bie))
-	b.crypt.EncryptBlockIndexEntry(ei, bih.EntryIVBase[:])
-
-	binary.Write(buf, binary.BigEndian, &bih)
-	binary.Write(buf, binary.BigEndian, &bies)
-	binary.Write(buf, binary.BigEndian, &ei)
-
-	glg.Logf("buf: % X", buf)
+	})
+	b.writeBlockIndex(buf, &bi)
 
 	_, err = b.Execute(&Operation{
 		Op: proto.StoreFile{
@@ -263,7 +256,7 @@ func (b *BoxBackup) StoreFile(d, m, a int64, fn string, fc []byte) error {
 			DiffFromFileID:    0, // 0 if the file is not a diff
 		},
 		Tail:   ef,
-		Stream: []byte(buf.String()),
+		Stream: buf,
 	})
 	if err != nil {
 		return fmt.Errorf("get file failed: %q", err)

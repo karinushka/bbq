@@ -1,11 +1,12 @@
 package client
 
 import (
+	"bbq/client/proto"
 	"bbq/crypto"
 	"io"
 	"net"
+	"os"
 	"testing"
-	"time"
 
 	"github.com/kpango/glg"
 )
@@ -23,6 +24,7 @@ func TestStoreFile(t *testing.T) {
 	bbc := NewBoxBackup(c, cr)
 	bbc.ready = true
 
+	done := make(chan bool)
 	go func() {
 		if err := bbs.StoreFile(1, 2, 3, "foo", []byte("bar")); err != nil {
 			t.Errorf("StoreFile: %s", err)
@@ -30,6 +32,7 @@ func TestStoreFile(t *testing.T) {
 		}
 		glg.Info("Written file")
 		s.Close()
+		done <- true
 	}()
 
 	h := make([]byte, 50)
@@ -37,9 +40,13 @@ func TestStoreFile(t *testing.T) {
 	glg.Infof("Header: % X", h)
 
 	bbc.readStream()
+	sendCommand(c, &Operation{Op: proto.Success{}})
+	<-done
 }
 
 func TestWriteFile(t *testing.T) {
+	glg.Get().DisableColor()
+
 	cr, err := crypto.NewCrypto("../1-FileEncKeys.raw")
 	if err != nil {
 		t.Errorf("Unable to load crypto")
@@ -52,23 +59,33 @@ func TestWriteFile(t *testing.T) {
 	bbc := NewBoxBackup(c, cr)
 	bbc.ready = true
 
+	w, err := os.Open("file.go")
+	if err != nil {
+		t.Errorf("Unable to open file: %s", err)
+		return
+	}
+	defer w.Close()
+
+	done := make(chan bool)
 	go func() {
-		f, err := bbs.CreateFile(3, "test", time.Now(), 101, 100)
+		f, err := bbs.CreateFile(3, "test")
 		glg.Infof("cr: %+v", f)
 		if err != nil {
 			t.Errorf("CreateFile: %s", err)
 			return
 		}
-		if _, err := f.Write([]byte("testing 123")); err != nil {
-			t.Errorf("Write: %s", err)
+		if _, err := io.Copy(f, w); err != nil {
+			t.Errorf("Write Error: %s", err)
 			return
 		}
+		glg.Info("Commiting")
 		if err := f.Commit(); err != nil {
 			t.Errorf("Commit: %s", err)
 			return
 		}
 		glg.Info("Created file")
 		s.Close()
+		done <- true
 	}()
 
 	h := make([]byte, 50)
@@ -76,4 +93,6 @@ func TestWriteFile(t *testing.T) {
 	glg.Infof("Header: % X", h)
 
 	bbc.readStream()
+	sendCommand(c, &Operation{Op: proto.Success{}})
+	<-done
 }

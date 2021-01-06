@@ -4,10 +4,12 @@ import (
 	"bbq/client/proto"
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/kpango/glg"
@@ -40,13 +42,116 @@ type blockIndex struct {
 	Blocks []proto.FileBlockIndexEntry
 }
 
+var fileModes = []struct {
+	unix   uint8
+	golang os.FileMode
+}{
+	// #define __S_IFIFO       0010000 // FIFO.
+	// #define __S_IFCHR       0020000 // Character device.
+	// #define __S_IFDIR       0040000 // Directory.
+	// #define __S_IFBLK       0060000 // Block device.
+	// #define __S_IFREG       0100000 // Regular file.
+	// #define __S_IFLNK       0120000 // Symbolic link.
+	// #define __S_IFSOCK      0140000 // Socket.
+	{0o1, os.ModeNamedPipe},
+	{0o2, os.ModeCharDevice},
+	{0o4, os.ModeDir},
+	{0o6, os.ModeDevice},
+	{0o10, 0},
+	{0o12, os.ModeSymlink},
+	{0o14, os.ModeSocket},
+}
+
+func readMode(m uint16) os.FileMode {
+	fm := os.FileMode(m & 0xFFF)
+	s := uint8(0xF & (m >> 12))
+	for _, k := range fileModes {
+		if k.unix == s {
+			fm |= k.golang
+			break
+		}
+	}
+	return fm
+}
+
+func writeMode(m os.FileMode) uint16 {
+	om := uint16(m & os.ModePerm)
+	s := m & os.ModeType
+	for _, k := range fileModes {
+		if k.golang == s {
+			om |= uint16(k.unix) << 12
+			break
+		}
+	}
+	return om
+}
+
+// Calculates rolling checksum, ala BoxBackup style.
+func calcRollingChecksum(b []byte) uint32 {
+	// Two halves of the weak rolling checksum
+	var wcA, wcB uint16
+	k := 0
+	for y := len(b); y > 0; y-- {
+		wcA += uint16(b[k])
+		wcB += uint16(y) * uint16(b[k])
+		k++
+	}
+	return uint32(wcB)<<16 | uint32(wcA)
+}
+
+// Decodes a single block into resulting size s.
+func (b *BoxBackup) decodeBlock(buf []byte, blk *proto.FileBlockIndexEntry) ([]byte, error) {
+	compressed := 1 == (buf[0] & 1)
+	encoder := buf[0] >> 1
+	glg.Debugf("chunk compressed: %v, encoded: %v", compressed, encoder)
+
+	var out []byte
+	if encoder != 0 {
+		d, err := b.crypt.DecryptFileData(buf[1:])
+		if err != nil {
+			glg.Errorf("decrypting file: %v", err)
+			return nil, err
+		}
+		out = d
+	} else {
+		out = buf[1:]
+	}
+
+	if compressed {
+		d := make([]byte, blk.Size)
+		if err := b.crypt.Decompress(out, d); err != nil {
+			glg.Errorf("decompression error: %v", err)
+			return nil, fmt.Errorf("decompression error: %v", err)
+		}
+		glg.Debugf("actual decompressed (size: %v): %s", len(d), d[0:20])
+		out = d
+	}
+
+	w := calcRollingChecksum(out)
+	// For some weird reason my rolling checksum is always off by a couple
+	// of increments for the subsequent blocks. Maybe there's a bug in
+	// BoxBackup checksum calculation somewhere.
+	if (blk.WeakChecksum ^ w) > 8 {
+		// glg.Logf("First bytes: % v, Last byte: % v", f.block[0:4], f.block[len(f.block)-4:])
+		glg.Errorf("Weak checksum failed: 0x%x != 0x%x", w, blk.WeakChecksum)
+	}
+
+	// Do the strong checksum
+	if md5.Sum(out) != blk.StrongChecksum {
+		glg.Error("MD5 checksum failed")
+		return nil, fmt.Errorf("MD5 checksum failed")
+	}
+
+	return out, nil
+}
+
 func (b *BoxBackup) writeBlockIndex(buf *bytes.Buffer, bix *blockIndex) error {
 	binary.Write(buf, binary.BigEndian, &bix.Index)
 	for i, s := range bix.Sizes {
 		binary.Write(buf, binary.BigEndian, &s)
 
 		// Encrypt the actual block
-		bi := bytes.NewBuffer([]byte{})
+		bi := new(bytes.Buffer)
 		binary.Write(bi, binary.BigEndian, bix.Blocks[i])
 		ei := bi.Next(binary.Size(bix.Blocks[i]))
 		b.crypt.EncryptBlockIndexEntry(ei, bix.Index.EntryIVBase[:])
@@ -74,14 +179,12 @@ func (b *BoxBackup) readBlockIndex(rd *Stream) *blockIndex {
 		er := bytes.NewReader(ent)
 		binary.Read(er, binary.BigEndian, &idx.Blocks[i])
 	}
-	glg.Logf("read index: %+v", idx)
 	return idx
 }
 
 func (b *BoxBackup) readFilenameStream(rd *Stream) (string, error) {
 	var fl uint16
 	binary.Read(rd, binary.LittleEndian, &fl)
-	glg.Infof("raw filenamesize: %X", fl)
 	enc := fl & 0x3
 	fl = fl>>2 - 2 // First two bytes are the length
 	glg.Debugf("filenamesize: %v, encoding: %v", fl, enc)
@@ -124,14 +227,14 @@ func (b *BoxBackup) writeAttributes(buf *bytes.Buffer, rf *RemoteFile) error {
 		AttributeType:    1, // ATTRIBUTETYPE_GENERIC_UNIX
 		UID:              rf.UID,
 		GID:              rf.GID,
-		ModificationTime: uint64(rf.ModificationTime.Unix() * 1e6),
+		ModificationTime: uint64(rf.ModificationTime.UnixNano() / 1000),
 		// TODO: fill out the missing members
 		// AttrModificationTime uint64
 		// UserDefinedFlags     uint32
 		// FileGenerationNumber uint32
-		Mode: rf.mode,
+		Mode: writeMode(rf.mode),
 	}
-	eab := bytes.NewBuffer([]byte{})
+	eab := new(bytes.Buffer)
 	binary.Write(eab, binary.BigEndian, &at)
 	ea := eab.Next(binary.Size(at))
 
@@ -174,7 +277,7 @@ func (b *BoxBackup) readAttributes(rd *Stream, rf *RemoteFile) error {
 
 	var s int32 // Attributes size
 	binary.Read(rd, binary.BigEndian, &s)
-	glg.Infof("attributes size: %v [% X]", s, s)
+	glg.Infof("attributes size: %v", s)
 	if s > 0 {
 		var enc uint8
 		binary.Read(rd, binary.BigEndian, &enc)
@@ -196,17 +299,24 @@ func (b *BoxBackup) readAttributes(rd *Stream, rf *RemoteFile) error {
 		if at.AttributeType != 1 { // ATTRIBUTETYPE_GENERIC_UNIX
 			return fmt.Errorf("unknown attribute type: %v", at.AttributeType)
 		}
-		if ar.Len() > 0 {
-			glg.Warnf("leftover attributes: %v [% X]", ar.Len(), ab[len(ab)-ar.Len():])
-		}
-		// TODO: check for following symlinks or xattrs
-
+		rf.mode = readMode(at.Mode)
 		rf.UID = at.UID
 		rf.GID = at.GID
 		rf.ModificationTime = time.Unix(int64(at.ModificationTime/1e6), 0)
 		rf.AttributesModTime = time.Unix(int64(at.AttrModificationTime/1e6), 0)
 		rf.FileGenerationNumber = at.FileGenerationNumber
-		rf.mode = at.Mode
+
+		if ar.Len() > 0 {
+			if rf.mode&os.ModeSymlink > 0 {
+				// Read symlink name after the attributes
+				rf.Symlink = string(ab[len(ab)-ar.Len():])
+				glg.Debugf("Read symlink: %s", rf.Symlink)
+			} else {
+				// TODO: check for following xattrs
+				glg.Warnf("leftover attributes: %v [% X]", ar.Len(), ab[len(ab)-ar.Len():])
+			}
+		}
+
 	}
 	return nil
 }
@@ -215,9 +325,6 @@ func (b *BoxBackup) readDirStream(rd *Stream) ([]*RemoteFile, error) {
 	var ds proto.DirStream
 	binary.Read(rd, binary.BigEndian, &ds)
 	glg.Debugf("dir: %+v", ds)
-        if ds.OptionsPresent != 0 {
-            glg.Warnf("Options detected: %+v", ds)
-        }
 
 	rf := &RemoteFile{
 		ParentId:          ds.ContainerID,
@@ -237,19 +344,11 @@ func (b *BoxBackup) readDirStream(rd *Stream) ([]*RemoteFile, error) {
 		if err != nil {
 			return nil, err
 		}
-		glg.Infof("decrypted filename: % X", fn)
-                /*
-                if len(fn) == 0 {
-                    bb := make([]byte, 5)
-                    rd.Read(bb)
-                    glg.Warnf("Trying to skip past: % X", bb)
-                }
-                */
 		f := &RemoteFile{
 			name:             fn,
 			Id:               e.ObjectID,
 			ParentId:         ds.ObjectID,
-			ModificationTime: time.Unix(int64(e.ModificationTime/1000000), 0),
+			ModificationTime: time.Unix(int64(e.ModificationTime/1e6), 0),
 			size:             e.SizeInBlocks,
 			Flags:            e.Flags,
 		}
@@ -315,30 +414,9 @@ func (b *BoxBackup) readFileStream(rd *Stream, idx *blockIndex) {
 			io.ReadFull(rd, buf)
 		}
 
-		compressed := 1 == (buf[0] & 1)
-		encoder := buf[0] >> 1
-		glg.Debugf("chunk compresed?: %v", compressed)
-		glg.Debugf("chunk encoder: %v", encoder)
-
-		ct, err := b.crypt.DecryptFileData(buf[1:])
-		if err != nil {
+		if _, err := b.decodeBlock(buf, &ent); err != nil {
+			glg.Errorf("Error decoding block: %s", err)
 			return
-		}
-
-		glg.Logf("Decoded size: %v", ent.Size)
-		if compressed {
-			glg.Debugf("Compressed header: % X", ct[0:10])
-			out := make([]byte, ent.Size)
-			if nil != b.crypt.Decompress(ct, out) {
-				glg.Errorf("decompression error: %v", err)
-				continue
-			}
-			glg.Debugf("actual decompressed: %s", out[0:20])
-
-			// TODO: verify checksum
-
-		} else {
-			glg.Infof("Decoded: %s [% X]", ct, ct)
 		}
 	}
 }

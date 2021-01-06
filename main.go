@@ -5,11 +5,13 @@ import (
 	"bbq/crypto"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alexeyco/simpletable"
 	prompt "github.com/c-bata/go-prompt"
@@ -174,6 +176,10 @@ func executor(in string) {
 		bb.Finish()
 		os.Exit(0)
 
+	case "refresh":
+		delete(dirCache, currentDir)
+		return
+
 	case "connect":
 
 	case "get":
@@ -209,6 +215,34 @@ func executor(in string) {
 		}
 		return
 
+	case "put":
+		if len(blocks) == 3 {
+			f, err := os.Open(blocks[1])
+			if err != nil {
+				glg.Errorf("Unable to open local file: %s", err)
+				return
+			}
+			defer f.Close()
+			rf, err := bb.CreateFile(currentDir, blocks[2])
+			if err != nil {
+				glg.Errorf("Unable to open remote file: %s", err)
+				return
+			}
+			rf.ModificationTime = time.Now()
+			rf.UID = 101
+			rf.GID = 100
+
+			if _, err := io.Copy(rf, f); err != nil {
+				glg.Errorf("Unable to open remote file: %s", err)
+				return
+			}
+			if err := rf.Commit(); err != nil {
+				glg.Errorf("Unable to open remote file: %s", err)
+				return
+			}
+		}
+		return
+
 	case "v", "ls", "dir":
 		printDirectory(blocks[1:])
 		return
@@ -232,6 +266,7 @@ func executor(in string) {
 		if ch = getHexId(n); ch == 0 {
 			for _, e := range de {
 				if (e.Flags&2) != 0 && e.Name() == n {
+					// fmt.Printf("Found dir: %+v\n", e)
 					ch = e.Id
 				}
 			}
@@ -348,7 +383,7 @@ func main() {
 		return
 	}
 
-	if err := bb.Login(1, true); err != nil {
+	if err := bb.Login(1, false); err != nil {
 		glg.Error(err)
 		return
 	}

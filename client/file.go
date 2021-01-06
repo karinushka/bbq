@@ -3,6 +3,7 @@ package client
 import (
 	"bbq/client/proto"
 	"bytes"
+	"compress/zlib"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/binary"
@@ -11,8 +12,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/karinushka/chunker/chunker"
 	"github.com/kpango/glg"
+	"rolling/chunker"
 )
 
 // RemoteFile structure implements os.FileInfo interface.
@@ -25,13 +26,14 @@ type RemoteFile struct {
 	size                 int64
 	UID                  uint32
 	GID                  uint32
-	mode                 uint16
+	mode                 os.FileMode
 	Flags                int16
 	ModificationTime     time.Time
 	AttributesModTime    time.Time
 	FileGenerationNumber uint32
 
 	entries []*RemoteFile
+	Symlink string
 
 	remote     *Stream
 	fileStream proto.FileStreamFormat
@@ -59,7 +61,7 @@ func (f *RemoteFile) Size() int64 {
 
 // file mode bits
 func (f *RemoteFile) Mode() os.FileMode {
-	m := os.FileMode(f.mode)
+	m := f.mode
 	if f.Flags&2 > 0 {
 		m |= os.ModeDir
 	}
@@ -91,7 +93,7 @@ func (b *BoxBackup) OpenFile(curDir, id int64) (*RemoteFile, error) {
 
 	rd, err := b.GetStream()
 	if err != nil {
-		return nil, fmt.Errorf("unale to read stream: %q", err)
+		return nil, fmt.Errorf("unable to read stream: %q", err)
 	}
 	f := &RemoteFile{
 		Id:        id,
@@ -165,52 +167,10 @@ func (f *RemoteFile) Read(p []byte) (int, error) {
 		buf := make([]byte, s)
 		io.ReadFull(f.remote, buf)
 
-		compressed := 1 == (buf[0] & 1)
-		encoder := buf[0] >> 1
-		glg.Debugf("chunk compresed?: %v", compressed)
-		glg.Debugf("chunk encoder: %v", encoder)
-
-		dec, err := f.boxBackup.crypt.DecryptFileData(buf[1:])
+		var err error
+		f.block, err = f.boxBackup.decodeBlock(buf, &blk)
 		if err != nil {
-			glg.Errorf("decrypting file: %v", err)
 			return 0, err
-		}
-
-		glg.Logf("Decoded size: %v", blk.Size)
-		if compressed {
-			f.block = make([]byte, blk.Size)
-			if nil != f.boxBackup.crypt.Decompress(dec, f.block) {
-				glg.Errorf("decompression error: %v", err)
-				return 0, fmt.Errorf("decompression error: %v", err)
-			}
-			glg.Debugf("actual decompressed: %s", f.block[0:20])
-
-		} else {
-			f.block = dec
-		}
-
-		// Two halves of the weak rolling checksum
-		var wcA, wcB uint16
-		k := 0
-		for y := len(f.block); y > 0; y-- {
-			wcA += uint16(f.block[k])
-			wcB += uint16(y) * uint16(f.block[k])
-			k++
-		}
-		w := uint32(wcB)<<16 | uint32(wcA)
-		// For some weird reason my rolling checksum is always off by a couple
-		// of increments for the subsequent blocks. Maybe there's a bug in
-		// BoxBackup checksum calculation somewhere.
-		if (blk.WeakChecksum ^ w) > 8 {
-			// glg.Logf("First bytes: % v, Last byte: % v", f.block[0:4], f.block[len(f.block)-4:])
-			glg.Errorf("Weak checksum failed for block %v in file %v (0x%x) 0x%x != 0x%x", f.curBlock, f.name, f.Id, w, blk.WeakChecksum)
-		}
-
-		// Do the strong checksum
-		if md5.Sum(f.block) != blk.StrongChecksum {
-			glg.Errorf("MD5 checksum failed for block %v in file %v (0x%x)", f.curBlock, f.name, f.Id)
-			return i, fmt.Errorf("MD5 checksum failed for block %v in file %v (0x%x)",
-				f.curBlock, f.name, f.Id)
 		}
 
 		f.blockLeft = 0
@@ -219,7 +179,7 @@ func (f *RemoteFile) Read(p []byte) (int, error) {
 	return i, nil
 }
 
-func (b *BoxBackup) CreateFile(curDir int64, name string, modTime time.Time, uid, gid uint32) (*RemoteFile, error) {
+func (b *BoxBackup) CreateFile(curDir int64, name string) (*RemoteFile, error) {
 	// TODO: handle AttributesHash and DiffFromFileID at some point.
 
 	f := &RemoteFile{
@@ -228,9 +188,7 @@ func (b *BoxBackup) CreateFile(curDir int64, name string, modTime time.Time, uid
 		// Id                   int64
 		ParentId: curDir,
 		// size                 int64
-		UID:              uid,
-		GID:              gid,
-		ModificationTime: modTime,
+		mode: 1, // File
 		// TODO: do other fields as well
 	}
 
@@ -241,7 +199,7 @@ func (b *BoxBackup) CreateFile(curDir int64, name string, modTime time.Time, uid
 
 	key := make([]byte, 32)
 	rand.Read(key)
-	var mean uint32 = 10240
+	var mean uint32 = 8192
 	var err error
 	if f.chunkify, err = chunker.ChunkifyInit(key, mean, 3*mean, cb); err != nil {
 		return nil, err
@@ -253,23 +211,21 @@ func (f *RemoteFile) Write(p []byte) (int, error) {
 	if err := f.chunkify.Write(p); err != nil {
 		return 0, err
 	}
-	glg.Info("Write")
-	return 0, nil
+	return len(p), nil
 }
 
 func (f *RemoteFile) Commit() error {
 	if err := f.chunkify.End(); err != nil {
 		return err
 	}
-	glg.Infof("chunks: %+v", f.chunks)
 
 	// First prepare the file stream
-	b := bytes.NewBuffer([]byte{})
+	b := new(bytes.Buffer)
 	fs := proto.FileStreamFormat{
 		MagicValue:       0x66696C65,
 		NumBlocks:        int64(len(f.chunks)),
 		ContainerID:      f.ParentId,
-		ModificationTime: f.ModificationTime.Unix(),
+		ModificationTime: f.ModificationTime.UnixNano() / 1000,
 		// TODO: these fields should be set to something
 		// MaxBlockClearSize: 0,
 		// Options:           0,
@@ -299,34 +255,51 @@ func (f *RemoteFile) Commit() error {
 	}
 	rand.Read(bi.Index.EntryIVBase[:])
 
-	iv := make([]byte, 16)
-	rand.Read(iv)
+	zb := new(bytes.Buffer)
+	z := zlib.NewWriter(zb)
+	var bh uint8 // Block header
 
 	// Send the file chunks first, as in Storage format.
-	var bh uint8 = 0b10
 	for _, ch := range f.chunks {
-		binary.Write(b, binary.BigEndian, &bh)
 
+		bi.Blocks = append(bi.Blocks, proto.FileBlockIndexEntry{
+			Size:           int32(len(ch)), // decrypted size
+			WeakChecksum:   calcRollingChecksum(ch),
+			StrongChecksum: md5.Sum(ch),
+		})
+
+		zb.Reset()
+		z.Reset(zb)
+		w, err := z.Write(ch)
+		if err != nil || w < len(ch) {
+			return err
+		}
+		z.Close()
+
+		// Compress only if can get below 95%
+		if (100 * zb.Len() / len(ch)) < 95 {
+			glg.Debugf("Compressed to: %v%% (%v, %v)", 100*zb.Len()/len(ch), zb.Len(), len(ch))
+			ch = zb.Bytes()
+			bh = 0b11
+		} else {
+			bh = 0b10
+		}
+
+		iv := make([]byte, 16)
+		rand.Read(iv)
 		ct, err := f.boxBackup.crypt.EncryptFileData(ch, iv)
 		if err != nil {
 			return err
 		}
+
+		binary.Write(b, binary.BigEndian, &bh)
 		b.Write(ct)
 
 		// Length of this fileblock including the byte header
 		bi.Sizes = append(bi.Sizes, int64(len(ct)+1))
-		bie := proto.FileBlockIndexEntry{
-			Size: int32(len(ch)), // decrypted size
-			// TODO: put proper checksum here
-			WeakChecksum:   1,
-			StrongChecksum: md5.Sum(ch),
-		}
-		bi.Blocks = append(bi.Blocks, bie)
 	}
 
 	f.boxBackup.writeBlockIndex(b, bi)
-
-	glg.Logf("buf: % X", b)
 
 	_, err = f.boxBackup.Execute(&Operation{
 		Op: proto.StoreFile{
@@ -338,7 +311,7 @@ func (f *RemoteFile) Commit() error {
 			DiffFromFileID: 0, // 0 if the file is not a diff
 		},
 		Tail:   ef,
-		Stream: []byte(b.String()),
+		Stream: b,
 	})
 	if err != nil {
 		return fmt.Errorf("get file failed: %q", err)

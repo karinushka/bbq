@@ -26,8 +26,8 @@ type BoxBackup struct {
 
 type Operation struct {
 	Op     interface{}
-	Tail   []byte // For variable trailers
-	Stream []byte // Follow up with this stream
+	Tail   []byte        // For variable trailers
+	Stream *bytes.Buffer // Follow up with this stream
 }
 
 func NewBoxBackup(srv net.Conn, crypt *crypto.Crypto) *BoxBackup {
@@ -164,10 +164,9 @@ func (b *BoxBackup) Execute(op *Operation) (interface{}, error) {
 			Command: proto.STREAM_TYPE,
 		}
 		//hdr.Size = uint32(binary.Size(hdr) + len(op.Stream))
-		hdr.Size = uint32(len(op.Stream))
+		hdr.Size = uint32(op.Stream.Len())
 		binary.Write(b.conn, binary.BigEndian, &hdr)
-		binary.Write(b.conn, binary.BigEndian, op.Stream)
-
+		op.Stream.WriteTo(b.conn)
 	}
 
 	// Read back the response header
